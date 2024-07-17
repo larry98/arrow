@@ -53,6 +53,9 @@ bool HashJoinSchema::IsTypeSupported(const DataType& type) {
   if (id == Type::EXTENSION) {
     return IsTypeSupported(*checked_cast<const ExtensionType&>(type).storage_type());
   }
+  if (id == Type::LIST) {
+    return is_primitive(*checked_cast<const ListType&>(type).value_type());
+  }
   return is_fixed_width(id) || is_binary_like(id) || is_large_binary_like(id);
 }
 
@@ -692,6 +695,20 @@ bool HashJoinSchema::HasLargeBinary() const {
   return false;
 }
 
+bool HashJoinSchema::HasList() const {
+  for (int side = 0; side <= 1; ++side) {
+    for (int icol = 0; icol < proj_maps[side].num_cols(HashJoinProjection::INPUT);
+         ++icol) {
+      const std::shared_ptr<DataType>& column_type =
+          proj_maps[side].data_type(HashJoinProjection::INPUT, icol);
+      if (is_list_like(column_type->id())) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 class HashJoinNode : public ExecNode, public TracedNode {
  public:
   HashJoinNode(ExecPlan* plan, NodeVector inputs, const HashJoinNodeOptions& join_options,
@@ -753,7 +770,8 @@ class HashJoinNode : public ExecNode, public TracedNode {
     //
     bool use_swiss_join;
 #if ARROW_LITTLE_ENDIAN
-    use_swiss_join = !schema_mgr->HasDictionaries() && !schema_mgr->HasLargeBinary();
+    use_swiss_join = !schema_mgr->HasDictionaries() && !schema_mgr->HasLargeBinary()
+      && !schema_mgr->HasList();
 #else
     use_swiss_join = false;
 #endif
@@ -1180,16 +1198,18 @@ std::pair<HashJoinNode*, std::vector<int>> BloomFilterPushdownContext::GetPushdo
                                              join_type == JoinType::FULL_OUTER;
   disable_bloom_filter_ = disable_bloom_filter_ || bloom_filter_does_not_apply_to_join;
 
-  // Bloom filter currently doesn't support dictionaries.
+  // Bloom filter currently doesn't support dictionaries and lists.
   for (int side = 0; side <= 1 && !disable_bloom_filter_; side++) {
     SchemaProjectionMap keys_to_input = start->schema_mgr_->proj_maps[side].map(
         HashJoinProjection::KEY, HashJoinProjection::INPUT);
-    // Bloom filter currently doesn't support dictionaries.
+    // Bloom filter currently doesn't support dictionaries and lists.
     for (int i = 0; i < keys_to_input.num_cols; i++) {
       int idx = keys_to_input.get(i);
       bool is_dict = start->inputs_[side]->output_schema()->field(idx)->type()->id() ==
                      Type::DICTIONARY;
-      if (is_dict) {
+      bool is_list = start->inputs_[side]->output_schema()->field(idx)->type()->id() ==
+                     Type::LIST;
+      if (is_dict || is_list) {
         disable_bloom_filter_ = true;
         break;
       }

@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 #include "arrow/compute/kernels/codegen_internal.h"
 #include "arrow/visit_data_inline.h"
@@ -232,6 +233,27 @@ struct VarLengthKeyEncoder : KeyEncoder {
   std::shared_ptr<DataType> type_;
 };
 
+struct ListFixedWidthChildEncoder : KeyEncoder {
+  using Offset = typename ListType::offset_type;
+
+  explicit ListFixedWidthChildEncoder(std::shared_ptr<DataType> type) :
+    type_(std::move(type)) {}
+
+  void AddLength(const ExecValue& data, int64_t batch_length, int32_t* lengths) override;
+
+  void AddLengthNull(int32_t* length) override;
+
+  Status Encode(const ExecValue& data, int64_t batch_length,
+                uint8_t** encoded_bytes) override;
+
+  void EncodeNull(uint8_t** encoded_bytes) override;
+
+  Result<std::shared_ptr<ArrayData>> Decode(uint8_t** encoded_bytes, int32_t length,
+                                            MemoryPool* pool) override;
+
+  std::shared_ptr<DataType> type_;
+};
+
 struct NullKeyEncoder : KeyEncoder {
   void AddLength(const ExecValue&, int64_t batch_length, int32_t* lengths) override {}
 
@@ -281,6 +303,33 @@ class ARROW_EXPORT RowEncoder {
   std::vector<uint8_t> encoded_nulls_;
   std::vector<std::shared_ptr<ExtensionType>> extension_types_;
 };
+
+template <typename ValidFunc, typename NullFunc>
+static void IterateList(const ArraySpan& arr, ValidFunc&& valid_func,
+                      NullFunc&& null_func) {
+  using offset_type = typename ListType::offset_type;
+  constexpr uint8_t empty_value = 0;
+
+  if (arr.length == 0) {
+    return;
+  }
+  const offset_type* offsets = arr.GetValues<offset_type>(1);
+  const uint8_t* child_data_buffer;
+  if (arr.child_data[0].buffers[1].data == NULLPTR) {
+    child_data_buffer = &empty_value;
+  } else {
+    child_data_buffer = arr.child_data[0].GetValues<uint8_t>(1);
+  }
+
+  const uint8_t* child_nullity_buffer = arr.child_data[0].buffers[0].data == NULLPTR ?
+    NULLPTR : arr.child_data[0].GetValues<uint8_t>(0);
+  VisitBitBlocksVoid(
+      arr.buffers[0].data, arr.offset, arr.length,
+      [&](int64_t i) {
+        valid_func(offsets[i], offsets[i + 1], child_nullity_buffer, child_data_buffer);
+      },
+      std::forward<NullFunc>(null_func));
+}
 
 }  // namespace internal
 }  // namespace compute

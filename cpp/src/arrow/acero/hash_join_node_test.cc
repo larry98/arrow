@@ -1221,7 +1221,9 @@ void TestHashJoinDictionaryHelper(
     // Whether to swap two inputs to the hash join
     bool swap_sides,
     // If true, send length=0 batches, if false, skip these batches
-    bool send_empty_batches = true) {
+    bool send_empty_batches = true,
+    // ignore_order=true runs AssertTablesEqualIgnoringOrder instead of AssertTablesEqual
+    bool ignore_order = true) {
   int64_t l_length = l_key.is_array()       ? l_key.array()->length
                      : l_payload.is_array() ? l_payload.array()->length
                                             : -1;
@@ -1366,7 +1368,11 @@ void TestHashJoinDictionaryHelper(
                        TableFromExecBatches(output_schema, expected_batches));
 
   // Compare results
-  AssertTablesEqualIgnoringOrder(expected, output);
+  if (ignore_order) {
+    AssertTablesEqualIgnoringOrder(expected, output);
+  } else {
+    AssertTablesEqual(*expected, *output);
+  }
 }
 
 TEST(HashJoin, Dictionary) {
@@ -1724,9 +1730,9 @@ TEST(HashJoin, UnsupportedTypes) {
   const bool parallel = false;
   const bool slow = false;
 
-  auto l_schema = schema({field("l_i32", int32()), field("l_list", list(int32()))});
+  auto l_schema = schema({field("l_i32", int32()), field("l_list", list(list(int32())))});
   auto l_schema_nolist = schema({field("l_i32", int32())});
-  auto r_schema = schema({field("r_i32", int32()), field("r_list", list(int32()))});
+  auto r_schema = schema({field("r_i32", int32()), field("r_list", list(list(int32())))});
   auto r_schema_nolist = schema({field("r_i32", int32())});
 
   std::vector<std::pair<std::shared_ptr<Schema>, std::shared_ptr<Schema>>> cases{
@@ -3252,6 +3258,132 @@ TEST(HashJoin, ManyJoins) {
 
   ASSERT_OK_AND_ASSIGN(std::ignore, DeclarationToTable(std::move(root)));
 }
+
+TEST(HashJoin, FixedLengthListJoin) {
+  const bool parallel = false;
+  const bool slow = false;
+  {
+    auto l_schema = schema({field("l_i32", int32()), field("l_list", list(int32()))});
+    auto r_schema = schema({field("r_i32", int32()), field("r_list", list(int32()))});
+
+    std::vector<FieldRef> l_keys{{"l_i32"}};
+    std::vector<FieldRef> r_keys{{"r_i32"}};
+
+    BatchesWithSchema l_batches = GenerateBatchesFromString(l_schema, {
+      R"([
+        [1, [4, 5, 6, 7, 8]],
+        [2, [100, 200, 300]],
+        [3, null],
+        [4, [123789, 43289]],
+        [null, []]
+      ])"
+    });
+    BatchesWithSchema r_batches = GenerateBatchesFromString(r_schema, {
+      R"([
+        [1, [-1, -2]],
+        [2, [400]],
+        [3, [null, 6969]],
+        [null, null]
+      ])"
+    });
+
+    BatchesWithSchema expected;
+    expected.batches = {
+        ExecBatchFromJSON({int32(), list(int32()), int32(), list(int32())}, R"([
+      [1, [4, 5, 6, 7, 8], 1, [-1, -2]],
+      [2, [100, 200, 300], 2, [400]],
+      [3, null, 3, [null, 6969]]
+    ])")};
+
+    expected.schema = schema({field("l_i32", int32()), field("l_list", list(int32())),
+      field("r_i32", int32()), field("r_list", list(int32()))});
+
+    AsyncGenerator<std::optional<ExecBatch>> sink_gen;
+
+    HashJoinNodeOptions join_options{JoinType::INNER, l_keys, r_keys};
+    Declaration left{"source",
+                      SourceNodeOptions{l_batches.schema, l_batches.gen(parallel, slow)}};
+    Declaration right{"source",
+                      SourceNodeOptions{r_batches.schema, r_batches.gen(parallel, slow)}};
+    Declaration join{"hashjoin", {std::move(left), std::move(right)}, join_options};
+
+    ASSERT_OK_AND_ASSIGN(auto actual, DeclarationToExecBatches(std::move(join)));
+
+    AssertExecBatchesEqual(expected.schema, expected.batches, actual.batches);
+    AssertSchemaEqual(expected.schema, actual.schema);
+  }
+
+  {
+    TestHashJoinDictionaryHelper(
+      JoinType::INNER, JoinKeyCmp::EQ, parallel,
+      // Input
+      ArrayFromJSON(utf8(), R"(["a", "b"])"),
+      ScalarFromJSON(list(int64()), "[1, 2, null, 4]"),
+      ArrayFromJSON(utf8(), R"(["a", null, "b"])"),
+      ArrayFromJSON(utf8(), R"(["p", "q", "r"])"),
+      // Expected output
+      ArrayFromJSON(utf8(), R"(["a", "b"])"), ArrayFromJSON(list(int64()), R"([[1, 2, null, 4], [1, 2, null, 4]])"),
+      ArrayFromJSON(utf8(), R"(["a", "b"])"), ArrayFromJSON(utf8(), R"(["p", "r"])"),
+      2, false, false, false);
+  }
+
+  {
+    auto l_schema = schema({field("l_i32", int32()), field("l_list", list(int32()))});
+    auto r_schema = schema({field("r_i32", int32()), field("r_list", list(int32()))});
+
+    std::vector<FieldRef> l_keys{{"l_list"}};
+    std::vector<FieldRef> r_keys{{"r_list"}};
+
+    BatchesWithSchema l_batches = GenerateBatchesFromString(l_schema, {
+      R"([
+        [1, []],
+        [4, null],
+        [5, [null, 5]],
+        [6, [5, null]],
+        [10, [null]],
+        [12, [1, 2, 3, 4]]
+      ])"
+    });
+    BatchesWithSchema r_batches = GenerateBatchesFromString(r_schema, {
+      R"([
+        [2, []],
+        [5, null],
+        [7, [null, 5]],
+        [8, [null, null]],
+        [11, [null]],
+        [13, [1, 2, 3, 4]],
+        [14, [998244353, 1000000007]]
+      ])"
+    });
+
+    BatchesWithSchema expected;
+    expected.batches = {
+        ExecBatchFromJSON({int32(), list(int32()), int32(), list(int32())}, R"([
+      [1, [], 2, []],
+      [5, [null, 5], 7, [null, 5]],
+      [10, [null], 11, [null]],
+      [12, [1, 2, 3, 4], 13, [1, 2, 3, 4]]
+    ])")};
+
+    expected.schema = schema({field("l_i32", int32()), field("l_list", list(int32())),
+      field("r_i32", int32()), field("r_list", list(int32()))});
+
+    AsyncGenerator<std::optional<ExecBatch>> sink_gen;
+
+    HashJoinNodeOptions join_options{JoinType::INNER, l_keys, r_keys};
+    Declaration left{"source",
+                      SourceNodeOptions{l_batches.schema, l_batches.gen(parallel, slow)}};
+    Declaration right{"source",
+                      SourceNodeOptions{r_batches.schema, r_batches.gen(parallel, slow)}};
+    Declaration join{"hashjoin", {std::move(left), std::move(right)}, join_options};
+
+    ASSERT_OK_AND_ASSIGN(auto actual, DeclarationToExecBatches(std::move(join)));
+
+    AssertExecBatchesEqual(expected.schema, expected.batches, actual.batches);
+    AssertSchemaEqual(expected.schema, actual.schema);
+  }
+}
+
 
 }  // namespace acero
 }  // namespace arrow
