@@ -56,6 +56,9 @@ bool HashJoinSchema::IsTypeSupported(const DataType& type) {
   if (id == Type::LIST) {
     return is_primitive(*checked_cast<const ListType&>(type).value_type());
   }
+  if (id == Type::LARGE_LIST) {
+    return is_primitive(*checked_cast<const LargeListType&>(type).value_type());
+  }
   return is_fixed_width(id) || is_binary_like(id) || is_large_binary_like(id);
 }
 
@@ -1205,11 +1208,11 @@ std::pair<HashJoinNode*, std::vector<int>> BloomFilterPushdownContext::GetPushdo
     // Bloom filter currently doesn't support dictionaries and lists.
     for (int i = 0; i < keys_to_input.num_cols; i++) {
       int idx = keys_to_input.get(i);
-      bool is_dict = start->inputs_[side]->output_schema()->field(idx)->type()->id() ==
-                     Type::DICTIONARY;
-      bool is_list = start->inputs_[side]->output_schema()->field(idx)->type()->id() ==
-                     Type::LIST;
-      if (is_dict || is_list) {
+      bool is_dict_cond = start->inputs_[side]->output_schema()->field(idx)->type()->id()
+                          == Type::DICTIONARY;
+      bool is_list_cond =
+              is_list(start->inputs_[side]->output_schema()->field(idx)->type()->id());
+      if (is_dict_cond || is_list_cond) {
         disable_bloom_filter_ = true;
         break;
       }

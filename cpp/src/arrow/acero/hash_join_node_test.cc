@@ -1221,9 +1221,7 @@ void TestHashJoinDictionaryHelper(
     // Whether to swap two inputs to the hash join
     bool swap_sides,
     // If true, send length=0 batches, if false, skip these batches
-    bool send_empty_batches = true,
-    // ignore_order=true runs AssertTablesEqualIgnoringOrder instead of AssertTablesEqual
-    bool ignore_order = true) {
+    bool send_empty_batches = true) {
   int64_t l_length = l_key.is_array()       ? l_key.array()->length
                      : l_payload.is_array() ? l_payload.array()->length
                                             : -1;
@@ -1368,11 +1366,7 @@ void TestHashJoinDictionaryHelper(
                        TableFromExecBatches(output_schema, expected_batches));
 
   // Compare results
-  if (ignore_order) {
-    AssertTablesEqualIgnoringOrder(expected, output);
-  } else {
-    AssertTablesEqual(*expected, *output);
-  }
+  AssertTablesEqualIgnoringOrder(expected, output);
 }
 
 TEST(HashJoin, Dictionary) {
@@ -3259,12 +3253,34 @@ TEST(HashJoin, ManyJoins) {
   ASSERT_OK_AND_ASSIGN(std::ignore, DeclarationToTable(std::move(root)));
 }
 
-TEST(HashJoin, FixedLengthListJoin) {
+void ListInnerJoinHelper(BatchesWithSchema l_batches, std::vector<FieldRef> l_keys,
+                         BatchesWithSchema r_batches, std::vector<FieldRef> r_keys,
+                         BatchesWithSchema expected,
+                         bool parallel, bool slow) {
+  AsyncGenerator<std::optional<ExecBatch>> sink_gen;
+
+  HashJoinNodeOptions join_options{JoinType::INNER, l_keys, r_keys};
+  Declaration left{"source",
+                    SourceNodeOptions{l_batches.schema, l_batches.gen(parallel, slow)}};
+  Declaration right{"source",
+                    SourceNodeOptions{r_batches.schema, r_batches.gen(parallel, slow)}};
+  Declaration join{"hashjoin", {std::move(left), std::move(right)}, join_options};
+
+  ASSERT_OK_AND_ASSIGN(auto actual, DeclarationToExecBatches(std::move(join)));
+
+  AssertExecBatchesEqual(expected.schema, expected.batches, actual.batches);
+  AssertSchemaEqual(expected.schema, actual.schema);
+}
+
+class FixedWidthListJoin : public testing::TestWithParam<std::shared_ptr<DataType>> {};
+
+TEST_P(FixedWidthListJoin, HashJoinTest) {
   const bool parallel = false;
   const bool slow = false;
-  {
-    auto l_schema = schema({field("l_i32", int32()), field("l_list", list(int32()))});
-    auto r_schema = schema({field("r_i32", int32()), field("r_list", list(int32()))});
+
+  auto fixedWidthListArrayJoinTest = [&](std::shared_ptr<DataType> list_type) {
+    auto l_schema = schema({field("l_i32", int32()), field("l_list", list_type)});
+    auto r_schema = schema({field("r_i32", int32()), field("r_list", list_type)});
 
     std::vector<FieldRef> l_keys{{"l_i32"}};
     std::vector<FieldRef> r_keys{{"r_i32"}};
@@ -3289,47 +3305,53 @@ TEST(HashJoin, FixedLengthListJoin) {
 
     BatchesWithSchema expected;
     expected.batches = {
-        ExecBatchFromJSON({int32(), list(int32()), int32(), list(int32())}, R"([
+        ExecBatchFromJSON({int32(), list_type, int32(), list_type}, R"([
       [1, [4, 5, 6, 7, 8], 1, [-1, -2]],
       [2, [100, 200, 300], 2, [400]],
       [3, null, 3, [null, 6969]]
     ])")};
 
-    expected.schema = schema({field("l_i32", int32()), field("l_list", list(int32())),
-      field("r_i32", int32()), field("r_list", list(int32()))});
+    expected.schema = schema({field("l_i32", int32()), field("l_list", list_type),
+      field("r_i32", int32()), field("r_list", list_type)});
 
-    AsyncGenerator<std::optional<ExecBatch>> sink_gen;
+    ListInnerJoinHelper(l_batches, l_keys, r_batches, r_keys, expected, parallel, slow);
+  };
 
-    HashJoinNodeOptions join_options{JoinType::INNER, l_keys, r_keys};
-    Declaration left{"source",
-                      SourceNodeOptions{l_batches.schema, l_batches.gen(parallel, slow)}};
-    Declaration right{"source",
-                      SourceNodeOptions{r_batches.schema, r_batches.gen(parallel, slow)}};
-    Declaration join{"hashjoin", {std::move(left), std::move(right)}, join_options};
+  auto fixedWidthListScalarJoinTest = [&](std::shared_ptr<DataType> list_type) {
+    auto l_schema = schema({field("l_i32", int32()), field("l_list", list_type)});
+    auto r_schema = schema({field("r_i32", int32()), field("r_list", list_type)});
 
-    ASSERT_OK_AND_ASSIGN(auto actual, DeclarationToExecBatches(std::move(join)));
+    BatchesWithSchema l_batches, r_batches;
 
-    AssertExecBatchesEqual(expected.schema, expected.batches, actual.batches);
-    AssertSchemaEqual(expected.schema, actual.schema);
-  }
+    auto l_batch = ExecBatch::Make({ArrayFromJSON(int32(), R"([1, 2])"),
+                    ScalarFromJSON(list_type, "[1, 2, null, 4]")});
+    auto r_batch = ExecBatch::Make({ArrayFromJSON(int32(), R"([1, 2, 3])"),
+                    ArrayFromJSON(list_type, R"([[], [1], [69]])")});
 
-  {
-    TestHashJoinDictionaryHelper(
-      JoinType::INNER, JoinKeyCmp::EQ, parallel,
-      // Input
-      ArrayFromJSON(utf8(), R"(["a", "b"])"),
-      ScalarFromJSON(list(int64()), "[1, 2, null, 4]"),
-      ArrayFromJSON(utf8(), R"(["a", null, "b"])"),
-      ArrayFromJSON(utf8(), R"(["p", "q", "r"])"),
-      // Expected output
-      ArrayFromJSON(utf8(), R"(["a", "b"])"), ArrayFromJSON(list(int64()), R"([[1, 2, null, 4], [1, 2, null, 4]])"),
-      ArrayFromJSON(utf8(), R"(["a", "b"])"), ArrayFromJSON(utf8(), R"(["p", "r"])"),
-      2, false, false, false);
-  }
+    l_batches.schema = l_schema;
+    l_batches.batches.push_back(l_batch.ValueOrDie());
+    r_batches.schema = r_schema;
+    r_batches.batches.push_back(r_batch.ValueOrDie());
 
-  {
-    auto l_schema = schema({field("l_i32", int32()), field("l_list", list(int32()))});
-    auto r_schema = schema({field("r_i32", int32()), field("r_list", list(int32()))});
+    std::vector<FieldRef> l_keys{{"l_i32"}};
+    std::vector<FieldRef> r_keys{{"r_i32"}};
+
+    BatchesWithSchema expected;
+    expected.batches = {
+        ExecBatchFromJSON({int32(), list_type, int32(), list_type}, R"([
+      [1, [1, 2, null, 4], 1, []],
+      [2, [1, 2, null, 4], 2, [1]]
+    ])")};
+
+    expected.schema = schema({field("l_i32", int32()),
+      field("l_list", list_type), field("r_i32", int32()), field("r_list", list_type)});
+
+    ListInnerJoinHelper(l_batches, l_keys, r_batches, r_keys, expected, parallel, slow);
+  };
+
+  auto fixedWidthKeyColumnJoinTest = [&](std::shared_ptr<DataType> list_type) {
+    auto l_schema = schema({field("l_i32", int32()), field("l_list", list_type)});
+    auto r_schema = schema({field("r_i32", int32()), field("r_list", list_type)});
 
     std::vector<FieldRef> l_keys{{"l_list"}};
     std::vector<FieldRef> r_keys{{"r_list"}};
@@ -3358,32 +3380,27 @@ TEST(HashJoin, FixedLengthListJoin) {
 
     BatchesWithSchema expected;
     expected.batches = {
-        ExecBatchFromJSON({int32(), list(int32()), int32(), list(int32())}, R"([
+        ExecBatchFromJSON({int32(), list_type, int32(), list_type}, R"([
       [1, [], 2, []],
       [5, [null, 5], 7, [null, 5]],
       [10, [null], 11, [null]],
       [12, [1, 2, 3, 4], 13, [1, 2, 3, 4]]
     ])")};
 
-    expected.schema = schema({field("l_i32", int32()), field("l_list", list(int32())),
-      field("r_i32", int32()), field("r_list", list(int32()))});
+    expected.schema = schema({field("l_i32", int32()), field("l_list", list_type),
+      field("r_i32", int32()), field("r_list", list_type)});
 
-    AsyncGenerator<std::optional<ExecBatch>> sink_gen;
+    ListInnerJoinHelper(l_batches, l_keys, r_batches, r_keys, expected, parallel, slow);
+  };
 
-    HashJoinNodeOptions join_options{JoinType::INNER, l_keys, r_keys};
-    Declaration left{"source",
-                      SourceNodeOptions{l_batches.schema, l_batches.gen(parallel, slow)}};
-    Declaration right{"source",
-                      SourceNodeOptions{r_batches.schema, r_batches.gen(parallel, slow)}};
-    Declaration join{"hashjoin", {std::move(left), std::move(right)}, join_options};
-
-    ASSERT_OK_AND_ASSIGN(auto actual, DeclarationToExecBatches(std::move(join)));
-
-    AssertExecBatchesEqual(expected.schema, expected.batches, actual.batches);
-    AssertSchemaEqual(expected.schema, actual.schema);
-  }
+  fixedWidthListArrayJoinTest(GetParam());
+  fixedWidthListScalarJoinTest(GetParam());
+  fixedWidthKeyColumnJoinTest(GetParam());
 }
 
+INSTANTIATE_TEST_SUITE_P(HashJoin, FixedWidthListJoin,
+  ::testing::Values(list(int32()), large_list(int32()),
+                    list(int64()), large_list(int64())));
 
 }  // namespace acero
 }  // namespace arrow

@@ -255,185 +255,6 @@ Result<std::shared_ptr<ArrayData>> DictionaryKeyEncoder::Decode(uint8_t** encode
   return data;
 }
 
-void ListFixedWidthChildEncoder::AddLength(
-  const ExecValue& data, int64_t batch_length, int32_t* lengths) {
-  std::shared_ptr<DataType> child_type =
-    std::dynamic_pointer_cast<ListType>(type_)->value_type();
-  Offset child_width = child_type->byte_width();
-
-  if (data.is_array()) {
-    int64_t i = 0;
-    IterateList(
-      data.array,
-      [&](Offset list_begin, Offset list_end, const uint8_t*, const uint8_t*)  {
-        Offset list_length = list_end - list_begin;
-        lengths[i++] += kExtraByteForNull + sizeof(Offset) +
-          list_length * (child_width + 1);
-      },
-      [&] { lengths[i++] += kExtraByteForNull + sizeof(Offset); });
-  } else {
-    int64_t buffer_size = 0;
-    if (data.scalar->is_valid) {
-      const auto& scalar = data.scalar_as<ListScalar>();
-      std::shared_ptr<ArrayData> scalar_data = scalar.value->data();
-      int64_t list_length = scalar_data->length;
-      int64_t scalar_width = scalar_data->type->byte_width();
-      buffer_size = list_length * (scalar_width + 1);
-    }
-    for (int64_t i = 0; i < batch_length; i++) {
-      lengths[i] += kExtraByteForNull + sizeof(Offset) + buffer_size;
-    }
-  }
-}
-
-void ListFixedWidthChildEncoder::AddLengthNull(int32_t* length) {
-  *length += kExtraByteForNull + sizeof(Offset);
-}
-
-Status ListFixedWidthChildEncoder::Encode(const ExecValue& data, int64_t batch_length,
-              uint8_t** encoded_bytes) {
-  std::shared_ptr<DataType> child_type =
-    std::dynamic_pointer_cast<ListType>(type_)->value_type();
-  Offset child_width = child_type->byte_width();
-
-  if (data.is_array()) {
-    IterateList(
-      data.array,
-      [&](Offset list_begin, Offset list_end, const uint8_t* list_null_buffer,
-        const uint8_t* list_data_buffer)  {
-        Offset list_length = list_end - list_begin;
-
-        auto& encoded_ptr = *encoded_bytes++;
-        *encoded_ptr++ = kValidByte;
-        util::SafeStore(encoded_ptr, static_cast<Offset>(list_length));
-        encoded_ptr += sizeof(Offset);
-
-        for (Offset j = 0; j < list_length; j++) {
-          if (list_null_buffer == NULLPTR ||
-            bit_util::GetBit(list_null_buffer, j + list_begin)) {
-            *encoded_ptr++ = kValidByte;
-            memcpy(encoded_ptr, list_data_buffer +
-              (list_begin + j) * child_width, child_width);
-          } else {
-            *encoded_ptr++ = kNullByte;
-            memset(encoded_ptr, 0, child_width);
-          }
-          encoded_ptr += child_width;
-        }
-      },
-      [&] {
-        auto& encoded_ptr = *encoded_bytes++;
-        *encoded_ptr++ = kNullByte;
-        util::SafeStore(encoded_ptr, static_cast<Offset>(0));
-        encoded_ptr += sizeof(Offset);
-      });
-  } else {
-    std::string val;
-    int64_t list_length = 0;
-    if (data.scalar->is_valid) {
-      const auto& scalar = data.scalar_as<ListScalar>();
-      std::shared_ptr<ArrayData> scalar_data = scalar.value->data();
-      list_length = scalar_data->length;
-      int64_t scalar_width = scalar_data->type->byte_width();
-      int64_t buffer_size = list_length * (scalar_width + 1);
-
-      val.reserve(buffer_size);
-      for (int64_t i = 0; i < list_length; i++) {
-        if (scalar_data->IsValid(i)) {
-          val.push_back(kValidByte);
-          for (int64_t k = 0; k < child_width; k++) {
-            val.push_back(
-              static_cast<char>(scalar_data->buffers[1]->data()[i * child_width + k]));
-          }
-        } else {
-          val.push_back(kNullByte);
-          for (int64_t k = 0; k < child_width; k++) {
-            val.push_back(static_cast<char>(0));
-          }
-        }
-      }
-    }
-
-    for (int64_t i = 0; i < batch_length; i++) {
-      auto& encoded_ptr = *encoded_bytes++;
-      *encoded_ptr++ = data.scalar->is_valid ? kValidByte : kNullByte;
-      util::SafeStore(encoded_ptr, static_cast<Offset>(list_length));
-      encoded_ptr += sizeof(Offset);
-      memcpy(encoded_ptr, val.data(), val.size());
-      encoded_ptr += static_cast<int64_t>(val.size());
-    }
-  }
-  return Status::OK();
-}
-
-void ListFixedWidthChildEncoder::EncodeNull(uint8_t** encoded_bytes) {
-  auto& encoded_ptr = *encoded_bytes;
-  *encoded_ptr++ = kNullByte;
-  util::SafeStore(encoded_ptr, static_cast<Offset>(0));
-  encoded_ptr += sizeof(Offset);
-}
-
-Result<std::shared_ptr<ArrayData>> ListFixedWidthChildEncoder::Decode(
-                  uint8_t** encoded_bytes, int32_t length, MemoryPool* pool) {
-  std::shared_ptr<DataType> child_type =
-    std::dynamic_pointer_cast<ListType>(type_)->value_type();
-  Offset child_width = child_type->byte_width();
-
-  std::shared_ptr<Buffer> null_buf;
-  int32_t null_count;
-  ARROW_RETURN_NOT_OK(DecodeNulls(pool, length, encoded_bytes, &null_buf, &null_count));
-
-  Offset length_sum = 0;
-  for (int64_t i = 0; i < length; ++i) {
-    length_sum += util::SafeLoadAs<Offset>(encoded_bytes[i]);
-  }
-
-  ARROW_ASSIGN_OR_RAISE(auto offset_buf,
-                        AllocateBuffer(sizeof(Offset) * (1 + length), pool));
-  ARROW_ASSIGN_OR_RAISE(auto key_buf, AllocateBuffer(length_sum * child_width, pool));
-  ARROW_ASSIGN_OR_RAISE(auto child_null_buf, AllocateBitmap(length_sum, pool));
-
-  auto raw_offsets = reinterpret_cast<Offset*>(offset_buf->mutable_data());
-  auto raw_keys = key_buf->mutable_data();
-  auto raw_child_validity = child_null_buf->mutable_data();
-
-  FirstTimeBitmapWriter writer(raw_child_validity, 0, length_sum);
-  Offset current_child_offset = 0;
-  int64_t child_null_count = 0;
-  for (int64_t i = 0; i < length; ++i) {
-    raw_offsets[i] = current_child_offset;
-
-    auto list_length = util::SafeLoadAs<Offset>(encoded_bytes[i]);
-    encoded_bytes[i] += sizeof(Offset);
-
-    for (int64_t j = 0; j < list_length; j++) {
-      if (encoded_bytes[i][0] == kValidByte) {
-        writer.Set();
-        encoded_bytes[i] += kExtraByteForNull;
-        memcpy(raw_keys + (current_child_offset + j) * child_width,
-          encoded_bytes[i], child_width);
-      } else { // encoded_bytes[i][0] == kNullByte
-        writer.Clear();
-        child_null_count++;
-        encoded_bytes[i] += kExtraByteForNull;
-        memset(raw_keys + (current_child_offset + j) * child_width, 0, child_width);
-      }
-      encoded_bytes[i] += child_width;
-      writer.Next();
-    }
-    current_child_offset += list_length;
-  }
-  raw_offsets[length] = current_child_offset;
-  writer.Finish();
-
-  std::vector<std::shared_ptr<ArrayData>> child_data = {ArrayData::Make(
-    std::dynamic_pointer_cast<ListType>(type_)->value_type(), length_sum,
-      {std::move(child_null_buf), std::move(key_buf)}, child_null_count)};
-
-  return ArrayData::Make(
-    type_, length, {std::move(null_buf), std::move(offset_buf)}, child_data, null_count);
-}
-
 void RowEncoder::Init(const std::vector<TypeHolder>& column_types, ExecContext* ctx) {
   ctx_ = ctx;
   encoders_.resize(column_types.size());
@@ -479,11 +300,19 @@ void RowEncoder::Init(const std::vector<TypeHolder>& column_types, ExecContext* 
       continue;
     }
 
-    if (is_list_like(type.id())) {
-      if (is_primitive(type.owned_type->field(0)->type()->id())) {
-        encoders_[i] =
-            std::make_shared<ListFixedWidthChildEncoder>(type.GetSharedPtr());
-        continue;
+    if (is_list(type.id())) {
+      if (is_primitive(type.type->field(0)->type()->id())) {
+        if (type.id() == Type::LIST) {
+          encoders_[i] =
+              std::make_shared<ListFixedWidthChildEncoder<ListType>>(type.GetSharedPtr());
+          continue;
+        }
+        if (type.id() == Type::LARGE_LIST) {
+          encoders_[i] =
+              std::make_shared<ListFixedWidthChildEncoder<LargeListType>>
+              (type.GetSharedPtr());
+          continue;
+        }
       }
     }
 
