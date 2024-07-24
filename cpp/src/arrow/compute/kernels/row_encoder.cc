@@ -300,6 +300,22 @@ void RowEncoder::Init(const std::vector<TypeHolder>& column_types, ExecContext* 
       continue;
     }
 
+    if (is_list(type.id())) {
+      if (is_primitive(type.type->field(0)->type()->id())) {
+        if (type.id() == Type::LIST) {
+          encoders_[i] =
+              std::make_shared<ListFixedWidthChildEncoder<ListType>>(type.GetSharedPtr());
+          continue;
+        }
+        if (type.id() == Type::LARGE_LIST) {
+          encoders_[i] =
+              std::make_shared<ListFixedWidthChildEncoder<LargeListType>>
+              (type.GetSharedPtr());
+          continue;
+        }
+      }
+    }
+
     // We should not get here
     ARROW_DCHECK(false);
   }
