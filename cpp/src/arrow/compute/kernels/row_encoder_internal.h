@@ -240,44 +240,34 @@ struct VarLengthKeyEncoder : KeyEncoder {
 
 // Iterates over an ArraySpan of lists and runs NullFunc if the list is null and ValidFunc
 // otherwise.
-// The arguments that ValidFunc takes in
+// The arguments that valid_func takes in
 // - starting offset of the list's nested-type
 // - ending offset of the list's nested-type
-// - the start of the validity buffer of the nested-type
-// - the start of the nested-type's buffers[1]
 template <typename T, typename ValidFunc, typename NullFunc = std::function<void()>>
 void IterateListArray(const ArraySpan& arr, ValidFunc&& valid_func,
                       NullFunc&& null_func = NullFunc{}) {
   using offset_type = typename T::offset_type;
-  constexpr uint8_t empty_value = 0;
 
   if (arr.length == 0) {
     return;
   }
   const offset_type* offsets = arr.GetValues<offset_type>(1);
-  const uint8_t* child_data_buffer;
-  if (arr.child_data[0].buffers[1].data == NULLPTR) {
-    child_data_buffer = &empty_value;
-  } else {
-    child_data_buffer = arr.child_data[0].GetValues<uint8_t>(1);
-  }
 
-  const uint8_t* child_validity_buffer = arr.child_data[0].buffers[0].data == NULLPTR ?
-    NULLPTR : arr.child_data[0].GetValues<uint8_t>(0);
   VisitBitBlocksVoid(
       arr.buffers[0].data, arr.offset, arr.length,
       [&](int64_t i) {
-        valid_func(offsets[i], offsets[i + 1], child_validity_buffer, child_data_buffer);
+        valid_func(offsets[i], offsets[i + 1]);
       },
       std::forward<NullFunc>(null_func));
 }
 
 // Helps process a list scalar by running NullFunc if the scalar is null and ValidFunc
 // otherwise.
-// The arguments that ValidFunc takes in
+// The arguments that valid_func takes in
 // - the size of the scalar list
 // - the start of the validity buffer of the nested-type
-// - the start of the nested-type's buffers[1]
+// - the start of the nested-type's buffers[1] if it exists and NULLPTR otherwise
+// - the start of the nested-type's buffers[2] if it exists and NULLPTR otherwise
 template<typename T, typename ValidFunc, typename NullFunc = std::function<void()>,
         typename ScalarType = typename TypeTraits<T>::ScalarType>
 void ProcessListScalar(const ScalarType& scalar, ValidFunc&& valid_func,
@@ -287,48 +277,200 @@ void ProcessListScalar(const ScalarType& scalar, ValidFunc&& valid_func,
     int64_t list_length = scalar_data->length;
     const uint8_t* scalar_validity_buf = scalar_data->buffers[0]->data() == NULLPTR ?
       NULLPTR : scalar_data->buffers[0]->data();
-    const uint8_t* scalar_data_buf = scalar_data->buffers[1]->data();
+    const uint8_t* scalar_data_buf_1 = scalar_data->buffers[1]->data() == NULLPTR ?
+      NULLPTR: scalar_data->buffers[1]->data();
+    const uint8_t* scalar_data_buf_2 =
+      scalar_data->buffers.size() < 3 || scalar_data->buffers[2]->data() == NULLPTR ?
+      NULLPTR : scalar_data->buffers[2]->data();
 
-    valid_func(list_length, scalar_validity_buf, scalar_data_buf);
+    valid_func(list_length, scalar_validity_buf, scalar_data_buf_1, scalar_data_buf_2);
   } else { // data.scalar->is_valid == false
     null_func();
   }
 }
 
+// A template to know how much more to allocate for the encoding of a list type for a
+// batch.
+// get_list_length must take
+// - the starting offset of the list
+// - the ending offset of the list
+// - the start of the validity buffer of the nested-type
+// - the start of the nested-type's buffers[1]
+// - the start of the nested-type's buffers[2] or NULLPTR if it does not exist
+// - returns: the amount of bytes to allocate for the list; get_list_length(0, 0, NULLPTR,
+//   NULLPTR, NULLPTR) must return the amount of space to allocate for a null list
+template<typename T, typename LengthFunc>
+void AddListLength(const ExecValue& data, int64_t batch_length, int32_t* lengths,
+                  LengthFunc&& get_list_length) {
+  using Offset = typename T::offset_type;
+  using ScalarType = typename TypeTraits<T>::ScalarType;
+
+  const int32_t null_list_length = get_list_length(0, 0, NULLPTR, NULLPTR, NULLPTR);
+  if (data.is_array()) {
+    const ArraySpan& arr = data.array;
+    const uint8_t* child_validity_buffer = arr.child_data[0].GetValues<uint8_t>(0);
+    const uint8_t* child_data_buffer_1 = arr.child_data[0].GetValues<uint8_t>(1);
+    const uint8_t* child_data_buffer_2 = arr.child_data[0].GetValues<uint8_t>(2);
+
+    int64_t i = 0;
+    IterateListArray<T>(
+      arr,
+      [&](Offset list_begin, Offset list_end) {
+        lengths[i++] += get_list_length(list_begin, list_end,
+          child_validity_buffer, child_data_buffer_1, child_data_buffer_2);
+      },
+      [&] { lengths[i++] += null_list_length; });
+  } else {
+    int32_t buffer_size;
+    ProcessListScalar<T>(
+      data.scalar_as<ScalarType>(),
+      [&](int64_t list_length, const uint8_t* child_validity_buf,
+        const uint8_t* child_data_buf_1, const uint8_t* child_data_buf_2) {
+        buffer_size = get_list_length(0, list_length,
+          child_validity_buf, child_data_buf_1, child_data_buf_2);
+      },
+      [&](){
+        buffer_size = null_list_length;
+      });
+    for (int64_t i = 0; i < batch_length; i++) {
+      lengths[i] += buffer_size;
+    }
+  }
+}
+
+// A template to encode a list type for a batch.
+// get_list_length must take (same as AddListLength)
+// - the starting offset of the list
+// - the ending offset of the list
+// - the start of the validity buffer of the nested-type
+// - the start of the nested-type's buffers[1]
+// - the start of the nested-type's buffers[2] or NULLPTR if it does not exist
+// - returns: the amount of bytes to allocate for the list; getListLength(0, 0, NULLPTR,
+//   NULLPTR, NULLPTR) must return the amount of space to allocate for a null list
+// encode_element and encode_null_element encodes elements of the lists
+// - take j, representing the element's position in the value array
+// - a pointer that points to the start of where to encode for the row
+// - the start of the nested-type's buffers[1] or NULLPTR if it does not exist
+// - the start of the nested-type's buffers[2] or NULLPTR if it does not exist
+template<typename T, typename LengthFunc, typename ElementEncoder, typename NullEncoder>
+void EncodeList(const ExecValue& data, int64_t batch_length, uint8_t** encoded_bytes,
+                LengthFunc&& get_list_length, ElementEncoder&& encode_element,
+                NullEncoder&& encode_null_element) {
+  using Offset = typename T::offset_type;
+  using ScalarType = typename TypeTraits<T>::ScalarType;
+
+  auto encode_list = [&](Offset list_begin, Offset list_end,
+    const uint8_t* child_validity_buffer, const uint8_t* child_data_buffer_1,
+    const uint8_t* child_data_buffer_2, uint8_t* encoded_ptr) {
+    const uint8_t* encoded_ptr_start = encoded_ptr;
+    Offset list_length = list_end - list_begin;
+    EncodeVarLengthHeader<Offset>(encoded_ptr, KeyEncoder::kValidByte, list_length);
+    for (Offset j = list_begin; j < list_end; j++) {
+      if (child_validity_buffer == NULLPTR ||
+        bit_util::GetBit(child_validity_buffer, j)) {
+        *encoded_ptr++ = KeyEncoder::kValidByte;
+        encode_element(j, encoded_ptr, child_data_buffer_1, child_data_buffer_2);
+      } else {
+        *encoded_ptr++ = KeyEncoder::kNullByte;
+        encode_null_element(j, encoded_ptr, child_data_buffer_1, child_data_buffer_2);
+      }
+    }
+    return encoded_ptr - encoded_ptr_start;
+  };
+
+  if (data.is_array()) {
+    const ArraySpan& arr = data.array;
+    const uint8_t* child_validity_buffer = arr.child_data[0].GetValues<uint8_t>(0);
+    const uint8_t* child_data_buffer_1 = arr.child_data[0].GetValues<uint8_t>(1);
+    const uint8_t* child_data_buffer_2 = arr.child_data[0].GetValues<uint8_t>(2);
+
+    IterateListArray<T>(
+      arr,
+      [&](Offset list_begin, Offset list_end) {
+        *encoded_bytes += encode_list(list_begin, list_end, child_validity_buffer,
+          child_data_buffer_1, child_data_buffer_2, *encoded_bytes);
+        encoded_bytes++;
+      },
+      [&] {
+        EncodeVarLengthHeader<Offset>(*encoded_bytes++, KeyEncoder::kNullByte);
+      });
+  } else {
+    ProcessListScalar<T>(
+      data.scalar_as<ScalarType>(),
+      [&](int64_t list_length, const uint8_t* scalar_validity_buffer,
+        const uint8_t* scalar_offset_buffer, const uint8_t* scalar_data_buffer) {
+        int64_t scalar_buffer_length = get_list_length(0, list_length,
+          scalar_validity_buffer, scalar_offset_buffer, scalar_data_buffer);
+        std::unique_ptr<uint8_t[]> raw_scalar_value =
+          std::make_unique<uint8_t[]>(scalar_buffer_length);
+        encode_list(0, list_length, scalar_validity_buffer, scalar_offset_buffer,
+          scalar_data_buffer, raw_scalar_value.get());
+        std::string_view value(
+          reinterpret_cast<char *>(raw_scalar_value.get()), scalar_buffer_length);
+
+        for (int64_t i = 0; i < batch_length; i++) {
+          memcpy(*encoded_bytes, value.data(), value.size());
+          *encoded_bytes += value.size();
+          encoded_bytes++;
+        }},
+      [&]() {
+        for (int64_t i = 0; i < batch_length; i++) {
+          EncodeVarLengthHeader<Offset>(*encoded_bytes++, KeyEncoder::kNullByte);
+        }});
+  }
+}
+
+// Decodes an encoded_bytes for a list type by filling out its child's validity map.
+// The arguments that both ValidFunc and NullFunc takes in
+// - i: representing the i-th list
+// - j: representing the j-th element of the list
+template<typename T, typename ValidFunc, typename NullFunc,
+typename Offset = typename T::offset_type>
+void DecodeList(uint8_t** encoded_bytes, int32_t length, int64_t child_length_sum,
+                      int64_t& child_null_count, Offset* raw_offset,
+                      uint8_t* raw_child_validity, ValidFunc&& valid_func,
+                      NullFunc&& null_func) {
+  FirstTimeBitmapWriter child_validity_writer(raw_child_validity, 0, child_length_sum);
+  Offset current_child_offset = 0;
+  for (int64_t i = 0; i < length; i++) {
+    raw_offset[i] = current_child_offset;
+    Offset list_length = util::SafeLoadAs<Offset>(encoded_bytes[i]);
+    encoded_bytes[i] += sizeof(Offset);
+
+    for (int64_t j = 0; j < list_length; j++) {
+      if (encoded_bytes[i][0] == KeyEncoder::kValidByte) {
+        child_validity_writer.Set();
+        encoded_bytes[i] += KeyEncoder::kExtraByteForNull;
+
+        valid_func(i, j);
+      } else { // encoded_bytes[i][0] == KeyEncoder::kNullByte
+        child_validity_writer.Clear();
+        child_null_count++;
+        encoded_bytes[i] += KeyEncoder::kExtraByteForNull;
+
+        null_func(i, j);
+      }
+      child_validity_writer.Next();
+    }
+    current_child_offset += list_length;
+  }
+  raw_offset[length] = current_child_offset;
+  child_validity_writer.Finish();
+}
+
 template<typename T>
 struct ListFixedWidthChildEncoder : KeyEncoder {
   using Offset = typename T::offset_type;
-  using ScalarType = typename TypeTraits<T>::ScalarType;
 
   explicit ListFixedWidthChildEncoder(std::shared_ptr<DataType> type) :
     type_(std::move(type)) {}
 
   void AddLength(const ExecValue& data, int64_t batch_length, int32_t* lengths) override {
-    std::shared_ptr<DataType> child_type =
-      std::static_pointer_cast<T>(type_)->value_type();
-    const int32_t child_width = child_type->byte_width();
-
-    if (data.is_array()) {
-      int64_t i = 0;
-      IterateListArray<T>(
-        data.array,
-        [&](Offset list_begin, Offset list_end, const uint8_t*, const uint8_t*) {
-          Offset list_length = list_end - list_begin;
-          lengths[i++] += kExtraByteForNull + sizeof(Offset) +
-            list_length * (child_width + 1);
-        },
-        [&] { lengths[i++] += kExtraByteForNull + sizeof(Offset); });
-    } else {
-      int32_t buffer_size = 0;
-      ProcessListScalar<T>(
-        data.scalar_as<ScalarType>(),
-        [&](int64_t list_length, const uint8_t*, const uint8_t*) {
-          buffer_size = list_length * (child_width + 1);
-        });
-      for (int64_t i = 0; i < batch_length; i++) {
-        lengths[i] += kExtraByteForNull + sizeof(Offset) + buffer_size;
-      }
-    }
+    auto get_list_buffer_size_wrapper = [&](Offset list_begin, Offset list_end,
+                                        const uint8_t*, const uint8_t*, const uint8_t*) {
+      return GetListBufferSize(list_begin, list_end);
+    };
+    AddListLength<T>(data, batch_length, lengths, get_list_buffer_size_wrapper);
   }
 
   void AddLengthNull(int32_t* length) override {
@@ -337,65 +479,28 @@ struct ListFixedWidthChildEncoder : KeyEncoder {
 
   Status Encode(const ExecValue& data, int64_t batch_length,
                 uint8_t** encoded_bytes) override {
-    std::shared_ptr<DataType> child_type =
-      std::static_pointer_cast<T>(type_)->value_type();
-    const int32_t child_width = child_type->byte_width();
+    const int32_t child_width =
+      std::static_pointer_cast<T>(type_)->value_type()->byte_width();
 
-    auto encodeList = [&](Offset list_begin, Offset list_end,
-      const uint8_t* list_validity_buffer, const uint8_t* list_data_buffer,
-      uint8_t* encoded_ptr) {
-      for (Offset j = list_begin; j < list_end; j++) {
-        if (list_validity_buffer == NULLPTR ||
-          bit_util::GetBit(list_validity_buffer, j)) {
-          *encoded_ptr++ = kValidByte;
-          memcpy(encoded_ptr, list_data_buffer + j * child_width, child_width);
-        } else {
-          *encoded_ptr++ = kNullByte;
-          memset(encoded_ptr, 0, child_width);
-        }
-        encoded_ptr += child_width;
-      }
-      return (list_end - list_begin) * (child_width + 1);
+    auto get_list_buffer_size_wrapper = [&](Offset list_begin, Offset list_end,
+                                        const uint8_t*, const uint8_t*, const uint8_t*) {
+      return GetListBufferSize(list_begin, list_end);
     };
 
-    if (data.is_array()) {
-      IterateListArray<T>(
-        data.array,
-        [&](Offset list_begin, Offset list_end,
-          const uint8_t* list_validity_buffer, const uint8_t* list_data_buffer) {
-          Offset list_length = list_end - list_begin;
-          EncodeVarLengthHeader<Offset>(*encoded_bytes, kValidByte, list_length);
-          *encoded_bytes += encodeList(
-            list_begin, list_end, list_validity_buffer, list_data_buffer, *encoded_bytes);
-          encoded_bytes++;
-        },
-        [&] {
-          EncodeVarLengthHeader<Offset>(*encoded_bytes++, kNullByte);
-        });
-    } else {
-      ProcessListScalar<T>(
-        data.scalar_as<ScalarType>(),
-        [&](int64_t list_length,
-          const uint8_t* scalar_validity_buf, const uint8_t* scalar_data_buf) {
-          int64_t buffer_size = list_length * (child_width + 1);
-          std::unique_ptr<uint8_t[]> raw_scalar_value =
-            std::make_unique<uint8_t[]>(buffer_size);
-          encodeList(0, list_length, scalar_validity_buf, scalar_data_buf,
-            raw_scalar_value.get());
-          std::string_view raw_value_str
-            (reinterpret_cast<char *>(raw_scalar_value.get()), buffer_size);
+    auto encode_element = [&](int64_t j, uint8_t*& encoded_ptr,
+      const uint8_t* child_data_buffer, const uint8_t*) {
+      memcpy(encoded_ptr, child_data_buffer + j * child_width, child_width);
+      encoded_ptr += child_width;
+    };
 
-          for (int64_t i = 0; i < batch_length; i++) {
-            EncodeVarLengthElement<Offset>(*encoded_bytes++, kValidByte,
-              list_length, raw_value_str);
-          }
-        },
-        [&]() {
-          for (int64_t i = 0; i < batch_length; i++) {
-            EncodeVarLengthHeader<Offset>(*encoded_bytes++, kNullByte);
-          }
-        });
-    }
+    auto encode_null_element = [&](int64_t, uint8_t*& encoded_ptr,
+      const uint8_t*, const uint8_t*) {
+      memset(encoded_ptr, 0, child_width);
+      encoded_ptr += child_width;
+    };
+
+    EncodeList<T>(data, batch_length, encoded_bytes, get_list_buffer_size_wrapper,
+      encode_element, encode_null_element);
     return Status::OK();
   }
 
@@ -424,38 +529,23 @@ struct ListFixedWidthChildEncoder : KeyEncoder {
                           AllocateBuffer(length_sum * child_width, pool));
     ARROW_ASSIGN_OR_RAISE(auto child_validity_buf, AllocateBitmap(length_sum, pool));
 
-    auto raw_offsets = reinterpret_cast<Offset*>(offset_buf->mutable_data());
-    auto raw_values = child_value_buf->mutable_data();
+    auto raw_offset = reinterpret_cast<Offset*>(offset_buf->mutable_data());
+    auto raw_child_values = child_value_buf->mutable_data();
     auto raw_child_validity = child_validity_buf->mutable_data();
 
-    FirstTimeBitmapWriter writer(raw_child_validity, 0, length_sum);
     Offset current_child_offset = 0;
     int64_t child_null_count = 0;
-    for (int64_t i = 0; i < length; ++i) {
-      raw_offsets[i] = current_child_offset;
-
-      auto list_length = util::SafeLoadAs<Offset>(encoded_bytes[i]);
-      encoded_bytes[i] += sizeof(Offset);
-
-      for (int64_t j = 0; j < list_length; j++) {
-        if (encoded_bytes[i][0] == kValidByte) {
-          writer.Set();
-          encoded_bytes[i] += kExtraByteForNull;
-          memcpy(raw_values + (current_child_offset + j) * child_width,
+    DecodeList<Offset>(encoded_bytes, length, length_sum,
+      child_null_count, raw_offset, raw_child_validity,
+      [&](int64_t i, int64_t){
+          memcpy(raw_child_values + current_child_offset * child_width,
             encoded_bytes[i], child_width);
-        } else { // encoded_bytes[i][0] == kNullByte
-          writer.Clear();
-          child_null_count++;
-          encoded_bytes[i] += kExtraByteForNull;
-          memset(raw_values + (current_child_offset + j) * child_width, 0, child_width);
-        }
-        encoded_bytes[i] += child_width;
-        writer.Next();
-      }
-      current_child_offset += list_length;
-    }
-    raw_offsets[length] = current_child_offset;
-    writer.Finish();
+          encoded_bytes[i] += child_width;
+          current_child_offset++;
+      }, [&](int64_t i, int64_t){
+          memset(raw_child_values + current_child_offset * child_width, 0, child_width);
+          encoded_bytes[i] += child_width;
+          current_child_offset++;});
 
     std::vector<std::shared_ptr<ArrayData>> child_data = {ArrayData::Make(
       std::static_pointer_cast<T>(type_)->value_type(), length_sum,
@@ -467,6 +557,155 @@ struct ListFixedWidthChildEncoder : KeyEncoder {
   }
 
   std::shared_ptr<DataType> type_;
+
+ private:
+  int64_t GetListBufferSize(Offset list_begin, Offset list_end) {
+    const int32_t child_width =
+      (std::static_pointer_cast<T>(type_)->value_type())->byte_width();
+
+    return kExtraByteForNull + sizeof(Offset) +
+      (list_end - list_begin) * (child_width + 1);
+  }
+};
+
+template<typename T, typename ChildType>
+struct ListVarLengthChildEncoder : KeyEncoder {
+  using ChildOffset = typename ChildType::offset_type;
+  using Offset = typename T::offset_type;
+
+  explicit ListVarLengthChildEncoder(std::shared_ptr<DataType> type) :
+    type_(std::move(type)) {}
+
+  void AddLength(const ExecValue& data, int64_t batch_length, int32_t* lengths) override {
+    AddListLength<T>(data, batch_length, lengths, GetListBufferSize);
+  }
+
+  void AddLengthNull(int32_t* length) override {
+    *length += kExtraByteForNull + sizeof(Offset);
+  }
+
+  Status Encode(const ExecValue& data, int64_t batch_length,
+                uint8_t** encoded_bytes) override {
+    auto encode_element = [&](int64_t j, uint8_t*& encoded_ptr,
+      const uint8_t* child_offset_buffer_, const uint8_t* child_data_buffer) {
+      const ChildOffset* child_offset_buffer =
+        reinterpret_cast<const ChildOffset*>(child_offset_buffer_);
+      ChildOffset element_begin = child_offset_buffer[j];
+      ChildOffset element_end = child_offset_buffer[j + 1];
+      ChildOffset element_size = element_end - element_begin;
+      util::SafeStore(encoded_ptr, static_cast<ChildOffset>(element_size));
+      encoded_ptr += sizeof(ChildOffset);
+      memcpy(encoded_ptr, child_data_buffer + element_begin, element_size);
+      encoded_ptr += element_size;
+    };
+
+    auto encode_null_element = [&](int64_t, uint8_t*& encoded_ptr,
+      const uint8_t*, const uint8_t*) {
+      util::SafeStore(encoded_ptr, static_cast<ChildOffset>(0));
+      encoded_ptr += sizeof(ChildOffset);
+    };
+    EncodeList<T>(data, batch_length, encoded_bytes,
+      GetListBufferSize, encode_element, encode_null_element);
+    return Status::OK();
+  }
+
+  void EncodeNull(uint8_t** encoded_bytes) override {
+    EncodeVarLengthHeader<Offset>(*encoded_bytes, kNullByte);
+  }
+
+  Result<std::shared_ptr<ArrayData>> Decode(uint8_t** encoded_bytes, int32_t length,
+                                            MemoryPool* pool) override {
+    std::shared_ptr<Buffer> null_buf;
+    int32_t null_count;
+    ARROW_RETURN_NOT_OK(DecodeNulls(pool, length, encoded_bytes, &null_buf, &null_count));
+
+    // computing total lengths to allocate buffers
+    Offset list_length_sum = 0;
+    ChildOffset child_length_sum = 0;
+    for (int64_t i = 0; i < length; i++) {
+      auto encoded_ptr = encoded_bytes[i];
+      Offset list_length = util::SafeLoadAs<Offset>(encoded_bytes[i]);
+      encoded_ptr += sizeof(Offset);
+      for (int64_t j = 0; j < list_length; j++) {
+        ChildOffset child_length =
+          util::SafeLoadAs<ChildOffset>(encoded_ptr + kExtraByteForNull);
+        child_length_sum += child_length;
+        encoded_ptr += kExtraByteForNull + sizeof(ChildOffset) + child_length;
+      }
+      list_length_sum += list_length;
+    }
+
+    ARROW_ASSIGN_OR_RAISE(auto offset_buf,
+                          AllocateBuffer(sizeof(Offset) * (1 + length), pool));
+    ARROW_ASSIGN_OR_RAISE(auto child_key_buf, AllocateBuffer(child_length_sum, pool));
+    ARROW_ASSIGN_OR_RAISE(auto child_validity_buf,
+                          AllocateBitmap(child_length_sum, pool));
+    ARROW_ASSIGN_OR_RAISE(auto child_offset_buf,
+                          AllocateBuffer(sizeof(ChildOffset) * (1 + list_length_sum)));
+
+    auto raw_offset = reinterpret_cast<Offset*>(offset_buf->mutable_data());
+    auto raw_child_key = child_key_buf->mutable_data();
+    auto raw_child_validity = child_validity_buf->mutable_data();
+    auto raw_child_offset =
+      reinterpret_cast<ChildOffset*>(child_offset_buf->mutable_data());
+
+    int64_t child_null_count = 0;
+    ChildOffset child_length_cumsum = 0;
+    DecodeList<T>(encoded_bytes, length, child_length_sum,
+      child_null_count, raw_offset, raw_child_validity,
+    [&](int64_t i, int64_t){
+      ChildOffset child_length = util::SafeLoadAs<ChildOffset>(encoded_bytes[i]);
+      encoded_bytes[i] += sizeof(ChildOffset);
+
+      memcpy(raw_child_key, encoded_bytes[i], child_length);
+      raw_child_key += child_length;
+      encoded_bytes[i] += child_length;
+
+      util::SafeStore<ChildOffset>(raw_child_offset, child_length_cumsum);
+      child_length_cumsum += child_length;
+      raw_child_offset++;
+    }, [&](int64_t i, int64_t){
+      encoded_bytes[i] += sizeof(ChildOffset);
+      util::SafeStore<ChildOffset>(raw_child_offset, child_length_cumsum);
+      raw_child_offset++;
+    });
+    util::SafeStore<ChildOffset>(raw_child_offset, child_length_cumsum);
+
+    std::vector<std::shared_ptr<ArrayData>> child_data = {ArrayData::Make(
+      std::static_pointer_cast<T>(type_)->value_type(), list_length_sum,
+        {std::move(child_validity_buf), std::move(child_offset_buf),
+          std::move(child_key_buf)}, child_null_count)};
+
+    return ArrayData::Make(
+      type_, length, {std::move(null_buf), std::move(offset_buf)},
+      child_data, null_count);
+  }
+
+  std::shared_ptr<DataType> type_;
+
+ private:
+  static int64_t GetListBufferSize(Offset list_begin, Offset list_end,
+                            const uint8_t* child_validity_buffer,
+                            const uint8_t* child_offset_buffer_,
+                            const uint8_t*) {
+    const ChildOffset* child_offset_buffer =
+      reinterpret_cast<const ChildOffset*>(child_offset_buffer_);
+    Offset list_size = list_end - list_begin;
+    int32_t length_sum = 0;
+    for (Offset j = list_begin; j < list_end; j++) {
+      if (child_validity_buffer == NULLPTR ||
+        bit_util::GetBit(child_validity_buffer, j)) {
+        ChildOffset element_begin = child_offset_buffer[j];
+        ChildOffset element_end = child_offset_buffer[j + 1];
+        ChildOffset element_len = element_end - element_begin;
+        length_sum += element_len;
+      }
+    }
+    int32_t buffer_size = kExtraByteForNull + sizeof(Offset)
+                          + (kExtraByteForNull + sizeof(ChildOffset)) * list_size
+                          + length_sum;
+    return buffer_size;
+  }
 };
 
 struct NullKeyEncoder : KeyEncoder {
