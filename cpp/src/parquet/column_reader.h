@@ -92,6 +92,9 @@ class PARQUET_EXPORT LevelDecoder {
   // Decodes a batch of levels into an array and returns the number of levels decoded
   int Decode(int batch_size, int16_t* levels);
 
+  // Decode a single run of levels and return the run length
+  int DecodeOneRun(int batch_size, int16_t* level);
+
  private:
   int bit_width_;
   int num_values_remaining_;
@@ -318,10 +321,12 @@ class PARQUET_EXPORT RecordReader {
   /// @param read_dictionary True if reading directly as Arrow dictionary-encoded
   /// @param read_dense_for_nullable True if reading dense and not leaving space for null
   /// values
+  /// @param read_run_end_encoded True if reading directly as Arrow run-end-encoded
   static std::shared_ptr<RecordReader> Make(
       const ColumnDescriptor* descr, LevelInfo leaf_info,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
-      bool read_dictionary = false, bool read_dense_for_nullable = false);
+      bool read_dictionary = false, bool read_dense_for_nullable = false,
+      bool read_run_end_encoded = false);
 
   virtual ~RecordReader() = default;
 
@@ -485,6 +490,13 @@ class BinaryRecordReader : virtual public RecordReader {
 class DictionaryRecordReader : virtual public RecordReader {
  public:
   virtual std::shared_ptr<::arrow::ChunkedArray> GetResult() = 0;
+};
+
+/// \brief Read records directly to run-end-encoded Arrow form (int32
+/// run ends). Only valid for BYTE_ARRAY columns
+class ReeRecordReader : virtual public RecordReader {
+ public:
+  virtual std::shared_ptr<::arrow::Array> GetResult() = 0;
 };
 
 }  // namespace internal

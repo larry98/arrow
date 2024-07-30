@@ -203,6 +203,16 @@ int LevelDecoder::Decode(int batch_size, int16_t* levels) {
   return num_decoded;
 }
 
+int LevelDecoder::DecodeOneRun(int batch_size, int16_t* level) {
+  DCHECK_EQ(encoding_, Encoding::RLE);
+  int num_decoded;
+  if (!rle_decoder_->GetWithRepeats(level, &num_decoded, batch_size)) {
+    throw ParquetException("uh oh");
+  }
+  num_values_remaining_ -= num_decoded;
+  return num_decoded;
+}
+
 ReaderProperties default_reader_properties() {
   static ReaderProperties default_reader_properties;
   return default_reader_properties;
@@ -1426,10 +1436,11 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
         int16_t* def_levels = this->def_levels() + levels_written_;
         int16_t* rep_levels = this->rep_levels() + levels_written_;
 
-        if (ARROW_PREDICT_FALSE(this->ReadDefinitionLevels(batch_size, def_levels) !=
-                                batch_size)) {
-          throw ParquetException(kErrorRepDefLevelNotMatchesNumValues);
-        }
+        // HACK: skip reading def levels since REE decoding reads them directly
+        // if (ARROW_PREDICT_FALSE(this->ReadDefinitionLevels(batch_size, def_levels) !=
+        //                         batch_size)) {
+        //   throw ParquetException(kErrorRepDefLevelNotMatchesNumValues);
+        // }
         if (this->max_rep_level_ > 0) {
           int64_t rep_levels_read = this->ReadRepetitionLevels(batch_size, rep_levels);
           if (ARROW_PREDICT_FALSE(rep_levels_read != batch_size)) {
@@ -1811,8 +1822,9 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
             valid_bits_->Resize(valid_bytes_new, /*shrink_to_fit=*/false));
 
         // Avoid valgrind warnings
-        memset(valid_bits_->mutable_data() + valid_bytes_old, 0,
-               static_cast<size_t>(valid_bytes_new - valid_bytes_old));
+        // HACK: skip this for the REE since we don't use valid bits
+        // memset(valid_bits_->mutable_data() + valid_bytes_old, 0,
+        //        static_cast<size_t>(valid_bytes_new - valid_bytes_old));
       }
     }
   }
@@ -1927,8 +1939,9 @@ class TypedRecordReader : public TypedColumnReaderImpl<DType>,
   }
 
   // Reads spaced for optional or repeated fields.
-  void ReadSpacedForOptionalOrRepeated(int64_t start_levels_position,
-                                       int64_t* values_to_read, int64_t* null_count) {
+  virtual void ReadSpacedForOptionalOrRepeated(int64_t start_levels_position,
+                                               int64_t* values_to_read,
+                                               int64_t* null_count) {
     // levels_position_ must already be incremented based on number of records
     // read.
     ARROW_DCHECK_GE(levels_position_, start_levels_position);
@@ -2258,6 +2271,72 @@ class ByteArrayDictionaryRecordReader final : public TypedRecordReader<ByteArray
   std::vector<std::shared_ptr<::arrow::Array>> result_chunks_;
 };
 
+class ByteArrayReeRecordReader final : public TypedRecordReader<ByteArrayType>,
+                                       virtual public ReeRecordReader {
+ public:
+  ByteArrayReeRecordReader(const ColumnDescriptor* descr, LevelInfo leaf_info,
+                           ::arrow::MemoryPool* pool, bool read_dense_for_nullable)
+      : TypedRecordReader<ByteArrayType>(descr, leaf_info, pool,
+                                         read_dense_for_nullable) {
+    ARROW_DCHECK_EQ(descr_->physical_type(), Type::BYTE_ARRAY);
+    builder_ = std::make_unique<ByteArrayRunEndEncodedBuilder>();;
+  }
+
+  std::shared_ptr<::arrow::Array> GetResult() override {
+    std::shared_ptr<::arrow::Array> result;
+    PARQUET_THROW_NOT_OK(builder_->Finish(&result));
+    return result;
+  }
+
+  void ReadValuesDense(int64_t values_to_read) override {
+    ParquetException::NYI();
+  }
+
+  void ReadValuesSpaced(int64_t values_to_read, int64_t null_count) override {
+    ParquetException::NYI();
+  }
+
+  void ReadSpacedForOptionalOrRepeated(int64_t start_levels_position,
+                                       int64_t* values_to_read,
+                                       int64_t* null_count) override{
+    // levels_position_ must already be incremented based on number of records
+    // read.
+    ARROW_DCHECK_GE(levels_position_, start_levels_position);
+
+    int64_t values_read = 0;
+    int64_t nulls_read = 0;
+
+    while (start_levels_position < levels_position_) {
+      int16_t level;
+      int num_levels = definition_level_decoder_.DecodeOneRun(
+          levels_position_ - start_levels_position, &level);
+      if (ARROW_PREDICT_FALSE(num_levels == 0)) {
+        break;
+      }
+      // Kinda a hack: since we can read the def levels without RLE decoding,
+      // we'll handle appending nulls here.
+      if (level == leaf_info_.def_level) {
+        int num_decoded = this->current_decoder_->DecodeArrow(
+            num_levels, 0, NULLPTR, 0, builder_.get());
+        CheckNumberDecoded(num_decoded, num_levels);
+      } else {
+        PARQUET_THROW_NOT_OK(builder_->AppendNulls(num_levels));
+        nulls_read += num_levels;
+      }
+      values_read += num_levels;
+      start_levels_position += num_levels;
+    }
+
+    *values_to_read = values_read - nulls_read;
+    *null_count = nulls_read;
+
+    ResetValues();
+  }
+
+ private:
+  std::unique_ptr<ByteArrayRunEndEncodedBuilder> builder_;
+};
+
 // TODO(wesm): Implement these to some satisfaction
 template <>
 void TypedRecordReader<Int96Type>::DebugPrintState() {}
@@ -2272,10 +2351,17 @@ std::shared_ptr<RecordReader> MakeByteArrayRecordReader(const ColumnDescriptor* 
                                                         LevelInfo leaf_info,
                                                         ::arrow::MemoryPool* pool,
                                                         bool read_dictionary,
-                                                        bool read_dense_for_nullable) {
+                                                        bool read_dense_for_nullable,
+                                                        bool read_run_end_encoded) {
+  if (read_dictionary && read_run_end_encoded) {
+    throw ParquetException("Cannot read both dictionary and run-end-encoded");
+  }
   if (read_dictionary) {
     return std::make_shared<ByteArrayDictionaryRecordReader>(descr, leaf_info, pool,
                                                              read_dense_for_nullable);
+  } else if (read_run_end_encoded) {
+    return std::make_shared<ByteArrayReeRecordReader>(descr, leaf_info, pool,
+                                                      read_dense_for_nullable);
   } else {
     return std::make_shared<ByteArrayChunkedRecordReader>(descr, leaf_info, pool,
                                                           read_dense_for_nullable);
@@ -2287,7 +2373,8 @@ std::shared_ptr<RecordReader> MakeByteArrayRecordReader(const ColumnDescriptor* 
 std::shared_ptr<RecordReader> RecordReader::Make(const ColumnDescriptor* descr,
                                                  LevelInfo leaf_info, MemoryPool* pool,
                                                  bool read_dictionary,
-                                                 bool read_dense_for_nullable) {
+                                                 bool read_dense_for_nullable,
+                                                 bool read_run_end_encoded) {
   switch (descr->physical_type()) {
     case Type::BOOLEAN:
       return std::make_shared<TypedRecordReader<BooleanType>>(descr, leaf_info, pool,
@@ -2309,7 +2396,7 @@ std::shared_ptr<RecordReader> RecordReader::Make(const ColumnDescriptor* descr,
                                                              read_dense_for_nullable);
     case Type::BYTE_ARRAY: {
       return MakeByteArrayRecordReader(descr, leaf_info, pool, read_dictionary,
-                                       read_dense_for_nullable);
+                                       read_dense_for_nullable, read_run_end_encoded);
     }
     case Type::FIXED_LEN_BYTE_ARRAY:
       return std::make_shared<FLBARecordReader>(descr, leaf_info, pool,

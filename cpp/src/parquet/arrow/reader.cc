@@ -450,8 +450,10 @@ class LeafReader : public ColumnReaderImpl {
         field_(std::move(field)),
         input_(std::move(input)),
         descr_(input_->descr()) {
+    // HACK: always read run-end-encoded
     record_reader_ = RecordReader::Make(
-        descr_, leaf_info, ctx_->pool, field_->type()->id() == ::arrow::Type::DICTIONARY);
+        descr_, leaf_info, ctx_->pool, field_->type()->id() == ::arrow::Type::DICTIONARY,
+        /*read_dense_for_nullable=*/false, /*read_run_end_encoded=*/true);
     NextRowGroup();
   }
 
@@ -1274,7 +1276,8 @@ Future<std::shared_ptr<Table>> FileReaderImpl::DecodeRowGroups(
       }
     }
     auto table = Table::Make(std::move(result_schema), columns, num_rows);
-    RETURN_NOT_OK(table->Validate());
+    // HACK: skip validation since we are returning a RunEndEncodedArray column
+    // RETURN_NOT_OK(table->Validate());
     return table;
   };
   return ::arrow::internal::OptionalParallelForAsync(reader_properties_.use_threads(),

@@ -88,6 +88,7 @@ using ::arrow::util::SafeLoadAs;
 
 using parquet::internal::BinaryRecordReader;
 using parquet::internal::DictionaryRecordReader;
+using parquet::internal::ReeRecordReader;
 using parquet::internal::RecordReader;
 using parquet::schema::GroupNode;
 using parquet::schema::Node;
@@ -479,6 +480,14 @@ Status TransferBinary(RecordReader* reader, MemoryPool* pool,
         reader, ::arrow::dictionary(::arrow::int32(), logical_type_field->type()),
         logical_type_field->nullable(), out);
   }
+
+  auto ree_reader = dynamic_cast<ReeRecordReader*>(reader);
+  if (ree_reader) {
+    std::shared_ptr<::arrow::Array> result = ree_reader->GetResult();
+    *out = std::make_shared<ChunkedArray>(result);
+    return Status::OK();
+  }
+
   ::arrow::compute::ExecContext ctx(pool);
   ::arrow::compute::CastOptions cast_options;
   cast_options.allow_invalid_utf8 = true;  // avoid spending time validating UTF8 data

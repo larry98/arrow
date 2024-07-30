@@ -115,6 +115,10 @@ class RleDecoder {
   template <typename T>
   bool Get(T* val);
 
+  /// Gets the next run of a single value. Returns false if there are no more.
+  template <typename T>
+  bool GetWithRepeats(T* val, int* num_repeats, int batch_size);
+
   /// Gets a batch of values.  Returns the number of decoded elements.
   template <typename T>
   int GetBatch(T* values, int batch_size);
@@ -296,6 +300,24 @@ class RleEncoder {
 template <typename T>
 inline bool RleDecoder::Get(T* val) {
   return GetBatch(val, 1) == 1;
+}
+
+template <typename T>
+inline bool RleDecoder::GetWithRepeats(T* val, int* num_repeats, int batch_size) {
+  if (repeat_count_ > 0) {  // Repeated value case.
+    *val = static_cast<T>(current_value_);
+    *num_repeats = std::min(repeat_count_, batch_size);
+    repeat_count_ -= *num_repeats;
+    return true;
+  } else if (literal_count_ > 0) {
+    if (!bit_reader_.GetValue(bit_width_, val)) return false;
+    *num_repeats = 1;
+    literal_count_--;
+    return true;
+  } else {
+    if (!NextCounts<T>()) return false;
+    return GetWithRepeats(val, num_repeats, batch_size);
+  }
 }
 
 template <typename T>

@@ -22,6 +22,10 @@
 #include <memory>
 #include <vector>
 
+#include "arrow/array/array_run_end.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/scalar.h"
 #include "arrow/util/spaced.h"
 
 #include "parquet/exception.h"
@@ -85,6 +89,7 @@ struct EncodingTraits<BooleanType> {
   using ArrowType = ::arrow::BooleanType;
   using Accumulator = ::arrow::BooleanBuilder;
   struct DictAccumulator {};
+  struct ReeAccumulator {};
 };
 
 template <>
@@ -95,6 +100,7 @@ struct EncodingTraits<Int32Type> {
   using ArrowType = ::arrow::Int32Type;
   using Accumulator = ::arrow::NumericBuilder<::arrow::Int32Type>;
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::Int32Type>;
+  struct ReeAccumulator {};
 };
 
 template <>
@@ -105,6 +111,7 @@ struct EncodingTraits<Int64Type> {
   using ArrowType = ::arrow::Int64Type;
   using Accumulator = ::arrow::NumericBuilder<::arrow::Int64Type>;
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::Int64Type>;
+  struct ReeAccumulator {};
 };
 
 template <>
@@ -114,6 +121,7 @@ struct EncodingTraits<Int96Type> {
 
   struct Accumulator {};
   struct DictAccumulator {};
+  struct ReeAccumulator {};
 };
 
 template <>
@@ -124,6 +132,7 @@ struct EncodingTraits<FloatType> {
   using ArrowType = ::arrow::FloatType;
   using Accumulator = ::arrow::NumericBuilder<::arrow::FloatType>;
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::FloatType>;
+  struct ReeAccumulator {};
 };
 
 template <>
@@ -134,6 +143,56 @@ struct EncodingTraits<DoubleType> {
   using ArrowType = ::arrow::DoubleType;
   using Accumulator = ::arrow::NumericBuilder<::arrow::DoubleType>;
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::DoubleType>;
+  struct ReeAccumulator {};
+};
+
+// RunEndEncodedBuilder is not type specialized, and hence is too slow.
+class ByteArrayRunEndEncodedBuilder {
+ public:
+  ByteArrayRunEndEncodedBuilder() {}
+
+  ::arrow::Status Append(const uint8_t* buf, int32_t len, int num_repeats) {
+    length_ += num_repeats;
+    RETURN_NOT_OK(value_builder_.Append(buf, len));
+    RETURN_NOT_OK(run_end_builder_.Append(length_));
+    return ::arrow::Status::OK();
+  }
+
+  ::arrow::Status Append(const uint8_t* buf, int32_t len) {
+    return Append(buf, len, 1);
+  }
+
+  ::arrow::Status AppendNulls(int32_t num_repeats) {
+    length_ += num_repeats;
+    RETURN_NOT_OK(value_builder_.AppendNull());
+    RETURN_NOT_OK(run_end_builder_.Append(length_));
+    return ::arrow::Status::OK();
+  }
+
+  ::arrow::Status AppendNull() {
+    return AppendNulls(1);
+  }
+
+  ::arrow::Status Finish(std::shared_ptr<::arrow::Array>* out) {
+    ARROW_ASSIGN_OR_RAISE(auto values, value_builder_.Finish());
+    ARROW_ASSIGN_OR_RAISE(auto run_ends, run_end_builder_.Finish());
+    ARROW_ASSIGN_OR_RAISE(auto ree_array,
+                          ::arrow::RunEndEncodedArray::Make(length_, run_ends, values));
+    *out = std::move(ree_array);
+
+    return ::arrow::Status::OK();
+  }
+
+  ::arrow::Status Reserve(int n) {
+    RETURN_NOT_OK(value_builder_.Reserve(n));
+    RETURN_NOT_OK(run_end_builder_.Reserve(n));
+    return ::arrow::Status::OK();
+  }
+
+ private:
+  ::arrow::BinaryBuilder value_builder_;
+  ::arrow::Int32Builder run_end_builder_;
+  int64_t length_ = 0;
 };
 
 template <>
@@ -149,6 +208,7 @@ struct EncodingTraits<ByteArrayType> {
     std::vector<std::shared_ptr<::arrow::Array>> chunks;
   };
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::BinaryType>;
+  using ReeAccumulator = ByteArrayRunEndEncodedBuilder;
 };
 
 template <>
@@ -159,6 +219,7 @@ struct EncodingTraits<FLBAType> {
   using ArrowType = ::arrow::FixedSizeBinaryType;
   using Accumulator = ::arrow::FixedSizeBinaryBuilder;
   using DictAccumulator = ::arrow::Dictionary32Builder<::arrow::FixedSizeBinaryType>;
+  struct ReeAccumulator {};
 };
 
 class ColumnDescriptor;
@@ -349,6 +410,16 @@ class TypedDecoder : virtual public Decoder {
                          typename EncodingTraits<DType>::DictAccumulator* builder) {
     return DecodeArrow(num_values, 0, /*valid_bits=*/NULLPTR, 0, builder);
   }
+
+  virtual int DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,
+                          int64_t valid_bits_offset,
+                          typename EncodingTraits<DType>::ReeAccumulator* builder) = 0;
+
+  int DecodeArrowNonNull(int num_values,
+                         typename EncodingTraits<DType>::ReeAccumulator* builder) {
+    return DecodeArrow(num_values, 0, /*valid_bits=*/NULLPTR, 0, builder);
+  }
+
 };
 
 template <typename DType>
