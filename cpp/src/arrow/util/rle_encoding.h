@@ -304,6 +304,7 @@ inline bool RleDecoder::Get(T* val) {
 
 template <typename T>
 inline bool RleDecoder::GetWithRepeats(T* val, int* num_repeats, int batch_size) {
+  if (ARROW_PREDICT_FALSE(batch_size == 0)) return false;
   if (repeat_count_ > 0) {  // Repeated value case.
     *val = static_cast<T>(current_value_);
     *num_repeats = std::min(repeat_count_, batch_size);

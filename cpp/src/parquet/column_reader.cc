@@ -205,6 +205,9 @@ int LevelDecoder::Decode(int batch_size, int16_t* levels) {
 
 int LevelDecoder::DecodeOneRun(int batch_size, int16_t* level) {
   DCHECK_EQ(encoding_, Encoding::RLE);
+  if (ARROW_PREDICT_FALSE(batch_size == 0)) {
+    return 0;
+  }
   int num_decoded;
   if (!rle_decoder_->GetWithRepeats(level, &num_decoded, batch_size)) {
     throw ParquetException("uh oh");
@@ -2285,6 +2288,7 @@ class ByteArrayReeRecordReader final : public TypedRecordReader<ByteArrayType>,
   std::shared_ptr<::arrow::Array> GetResult() override {
     std::shared_ptr<::arrow::Array> result;
     PARQUET_THROW_NOT_OK(builder_->Finish(&result));
+    builder_ = std::make_unique<ByteArrayRunEndEncodedBuilder>();;
     return result;
   }
 
@@ -2306,10 +2310,19 @@ class ByteArrayReeRecordReader final : public TypedRecordReader<ByteArrayType>,
     int64_t values_read = 0;
     int64_t nulls_read = 0;
 
+    int16_t level;
+    int num_levels = definition_level_decoder_.DecodeOneRun(
+        levels_position_ - start_levels_position, &level);
+
     while (start_levels_position < levels_position_) {
-      int16_t level;
-      int num_levels = definition_level_decoder_.DecodeOneRun(
-          levels_position_ - start_levels_position, &level);
+      // TODO: move this run coalescing logic into RleDecoder.
+      int16_t peek_level;
+      int num_peek_levels = 0;
+      do {
+        num_levels += num_peek_levels;
+        num_peek_levels = definition_level_decoder_.DecodeOneRun(
+            levels_position_ - start_levels_position - num_levels, &peek_level);
+      } while (num_peek_levels > 0 && level == peek_level);
       if (ARROW_PREDICT_FALSE(num_levels == 0)) {
         break;
       }
@@ -2325,6 +2338,8 @@ class ByteArrayReeRecordReader final : public TypedRecordReader<ByteArrayType>,
       }
       values_read += num_levels;
       start_levels_position += num_levels;
+      level = peek_level;
+      num_levels = num_peek_levels;
     }
 
     *values_to_read = values_read - nulls_read;

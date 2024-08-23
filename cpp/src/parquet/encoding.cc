@@ -2163,13 +2163,25 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
 
     const auto* dict_values = dictionary_->data_as<ByteArray>();
 
+    int32_t idx;
+    int num_repeats;
+    bool ok = idx_decoder_.GetWithRepeats(&idx, &num_repeats, num_values);
+    if (!ok) {
+      *out_num_values = 0;
+      return Status::OK();
+    }
+
     int values_decoded = 0;
     while (values_decoded < num_values) {
-      int32_t idx;
-      int num_repeats;
-      bool ok = idx_decoder_.GetWithRepeats(
-          &idx, &num_repeats, num_values - values_decoded);
-      if (ARROW_PREDICT_FALSE(!ok)) {
+      // TODO: move this run coalescing logic into RleDecoder.
+      int32_t peek_idx;
+      int num_peek_repeats = 0;
+      do {
+        num_repeats += num_peek_repeats;
+        ok = idx_decoder_.GetWithRepeats(
+            &peek_idx, &num_peek_repeats, num_values - values_decoded - num_repeats);
+      } while (ok && (idx == peek_idx));
+      if (ARROW_PREDICT_FALSE(num_repeats == 0)) {
         break;
       }
       DCHECK_GT(num_repeats, 0);
@@ -2178,6 +2190,9 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
       const auto& val = dict_values[idx];
       RETURN_NOT_OK(builder->Append(val.ptr, val.len, num_repeats));
       values_decoded += num_repeats;
+
+      idx = peek_idx;
+      num_repeats = num_peek_repeats;
     }
     *out_num_values = values_decoded;
     return Status::OK();
